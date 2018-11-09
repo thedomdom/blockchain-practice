@@ -9,6 +9,7 @@ requests = "*"
 flask = "*"
 ipykernel = "*"
 jupyter = "*"
+jdc = "*"
 
 [dev-packages]
 
