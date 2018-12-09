@@ -12,13 +12,26 @@ from collections import OrderedDict
 import hashlib
 import json
 from utils import *
+import requests
+import copy
 
 
 class Wallet:
-    def __init__(self, private_key_str=None):
+    def __init__(self, private_key_str=None, parent_node_address=None):
         keypair = self.generate_keypair(private_key_str)
         self.private_key = keypair['private_key']
         self.public_key = keypair['public_key']
+
+        # UTXOs owned by the wallet;
+        # format: TransactionOutput.id:TransactionOutput
+        self.UTXOs = OrderedDict({})
+        self.parent_node = None  # String i.e. '127.0.0.1:5001'
+        self.balance = None  # Floating value of the balance
+        # Note that the following lines have to be at the
+        # end of the constructor.
+        if parent_node_address is not None:
+            self.parent_node = parent_node_address
+            self.calculate_balance()
 
     def generate_keypair(self, private_key_str):
         # If this is a 'new' wallet, i.e. no private_key_str has been given to the constructor
@@ -38,6 +51,74 @@ class Wallet:
             'public_key': binascii.hexlify(private_key.public_key().export_key(format='DER')).decode('utf8')
         }
         return keypair
+
+    def update_UTXOs(self):
+        request_data = {'public_key': self.public_key}
+        UTXOs_json = requests.get('http://' + self.parent_node + '/get_UTXOs_for_public_key', data=request_data).content
+
+        # Clear old UTXOs
+        self.UTXOs = OrderedDict({})
+        # Loop through the result and generate TransactionOutput objects
+        # Add them to the UTXOs ordered dict
+        for UTXO_id, UTXO_odict in create_odict_from_json(UTXOs_json).items():
+            self.UTXOs[UTXO_id] = TransactionOutput.from_odict(UTXO_odict)
+
+    def calculate_balance(self):
+        if self.parent_node is not None:
+            self.update_UTXOs()
+            balance = 0
+            for UTXO in self.UTXOs.values():
+                balance += UTXO.value
+
+            self.balance = balance
+
+    ## New (4_3) 1
+    def create_signed_transaction(self, recipient_pub_key, value):
+        # Creates a signed Transaction with UTXOs from the own UTXO Pool
+        # The Wallet has to be connected to a parent FullNode to
+        # be able to run this method. Receiver is recipient_pub_key, value is self
+        # explaining. Outputs can be max. 2 TOs (one main, one change)
+
+        # Update balance
+        if self.parent_node is not None:
+            self.calculate_balance()
+
+            # Check if balance is sufficient
+            if value > self.balance:
+                raise ValueError('Value exceeds balance')
+            used_UTXO_ids = []  # these are the inputs
+
+            #  Loop through UTXOs up to the point where the value is exceeded
+            sum_of_UTXOs = 0
+            used_UTXO_ids = []
+            for UTXO_id, UTXO in self.UTXOs.items():
+                sum_of_UTXOs += UTXO.value
+                used_UTXO_ids.append(UTXO.id)
+                if sum_of_UTXOs >= value:
+                    break
+
+            outputs = OrderedDict()
+            recipient_output = TransactionOutput(recipient_pub_key, value)
+            outputs[recipient_output.id] = recipient_output
+
+            # If sum doesn't exactly add up, create change transaction to own wallet
+            if sum_of_UTXOs > value:
+                change_output = TransactionOutput(self.public_key, sum_of_UTXOs - value)
+                outputs[change_output.id] = change_output
+            gen_transaction = Transaction(self.public_key, used_UTXO_ids, outputs)
+            gen_transaction.sign_transaction(self.private_key)
+            return (gen_transaction)
+        else:
+            print('No parent not connected, please connect parent node first.')
+            return (None)
+
+    ## New (4_3) 2
+    def post_signed_transaction(self, signed_transaction):
+        # Posts the signed_transaction to the parent full node.
+
+        request_data = json.dumps(signed_transaction.get_full_odict()).encode('utf8')
+        response = requests.post('http://' + self.parent_node + '/post_transaction', data=request_data)
+        return (response)
 
 
 class Transaction:
@@ -192,6 +273,26 @@ class Transaction:
             return True
         return False
 
+    @classmethod
+    def from_odict(cls, transaction_odict):
+        # Creates a Transaction object based on the transaction_odict.
+
+        # First this create TransactionOutput Objects
+        # for the TOs of this Transaction, then these TOs
+        # are passed on to
+        # the Transaction class constructor.
+        ordered_dict_of_outputs = OrderedDict()
+        for output in transaction_odict['outputs'].values():
+            ordered_dict_of_outputs[output['id']] = TransactionOutput(output['recipient'], output['value'],
+                                                                      output['random'], output['id'], output['time'])
+        response = cls(transaction_odict['sender'],
+                       transaction_odict['inputs'],
+                       ordered_dict_of_outputs,
+                       transaction_odict['timestamp'],
+                       transaction_odict['signature'],
+                       transaction_odict['id'])
+        return response
+
 
 class TransactionOutput:
     def __init__(self, recipient_public_key, value, random_val=None, id=None, timestamp=None):
@@ -242,6 +343,16 @@ class TransactionOutput:
 
         response = self.odict_transaction_output()
         response['id'] = self.id
+        return response
+
+    @classmethod
+    def from_odict(cls, transaction_output_odict):
+        # transaction_output_odict = create_odict_from_json(transaction_output_json)
+        response = cls(transaction_output_odict['recipient'],
+                       transaction_output_odict['value'],
+                       transaction_output_odict['random'],
+                       transaction_output_odict['id'],
+                       transaction_output_odict['time'], )
         return response
 
 
@@ -390,6 +501,24 @@ class Block:
                 '0' * blockchain.initial_difficulty:
             return False
         return True
+
+    @classmethod
+    def from_odict(cls, block_odict):
+        # Creates a Block object from an OrderedDict object
+        # (which contains the required information for the Block creation)
+
+        # First create the Transactions,
+        # then pass the Transactions on to the Block
+        # constructor.
+        ordered_dict_of_transactions = OrderedDict()
+        for transaction_odict in block_odict['transactions'].values():
+            transaction = Transaction.from_odict(transaction_odict)
+            ordered_dict_of_transactions[transaction.id] = transaction
+        response = cls(ordered_dict_of_transactions,
+                       block_odict['previous_hash'],
+                       block_odict['timestamp'],
+                       block_odict['nonce'])
+        return (response)
 
 
 class Blockchain:
@@ -573,3 +702,294 @@ class Blockchain:
 
         # If there is no transaction in the mempool no block can be mined
         return (None)
+
+
+class FullNode:
+    def __init__(self):
+        self.address = None  # possible string later on
+        self.neighbors = list()  # list of strings
+        self.current_chain_itterator = 1  # int
+        self.public_key_receiver_coinbase_transaction = None  # string
+        self.primary_chain_id = self.current_chain_itterator  # string
+        self.chains = OrderedDict()  # chain_id:chain
+        self.chains[str(self.current_chain_itterator)] = Blockchain()  # Creates first chain
+        self.orphan_block_pool = OrderedDict()  # Block.id:Block
+
+        # List of known block_id_s_initially only genesis_block_id
+        self.seen_block_ids = [self.get_primary_chain().get_last_block().id]
+
+        # list of transactions ids that the Node is aware of
+        self.seen_transaction_ids = list()
+
+    def process_incoming_block(self, new_block, pause_mining_event):
+        # Identifies if there is a matching chain by examining the result of
+        # add_block(new block). If there is no matching chain, the new_block
+        # is added to the orphan_block_pool. If the new_block was added to any
+        # chain other than the primary chain, the primary chain is reset.
+
+        # If the block has been processed before and is not part of the orphan pool -->
+        # ignore the block. Orphan blocks can be processed multiple times (they have to
+        # to be processed multiple times).
+        if (new_block.id not in self.seen_block_ids) \
+                or (new_block.id in self.orphan_block_pool.keys()):
+
+            # If the block is new (no former orphan) add it to the list of seen ids.
+            if new_block.id not in self.seen_block_ids:
+                self.seen_block_ids.append(new_block.id)
+
+            # In case the block doesn't match any existing chain, it goes to the orphan pool
+            is_orphan = True
+            print('Start processing Block ' + new_block.id[:7] + '...')
+
+            # Iterate over all chains in the pool and check if the new_block can be added
+            for chain_id, chain in self.chains.items():
+
+                # Make a full copy of the chain in case the block is added to it
+                backup_chain = copy.deepcopy(chain)
+
+                # Possibly add the block, if added add_block returns True
+                if chain.add_block(new_block):
+                    print('Added Block ' + new_block.id[:7] + '... to chain ' + chain_id)
+                    # Block is no orphan any longer
+                    is_orphan = False
+                    # In case the chain where the block was added is not
+                    # the primary chain, the primary chain might have to be reset:
+                    new_chain_selected = False
+                    if not self.get_primary_chain() == chain:
+                        new_chain_selected = self.set_primary_chain()
+
+                    # Just for debuging
+                    if new_chain_selected:
+                        print('New primary chain selected, id: ' + str(chain_id))
+
+                    # If either the primary chain switches or if the block was
+                    # added to the current primary chain, mining has to be restarted
+                    # (i.e. paused and then restarted)
+                    # In this case the block is propagated to the neighbors
+                    if self.get_primary_chain() == chain:
+                        pause_mining_event.set()
+                        print('Mining is paused due to new block information')
+                        # Propagate Block:
+                        self.propagate_block(new_block.id)
+
+                    # Add the backuped_chain to the chains to enable emergence of
+                    # competing forks.
+                    self.add_backuped_chain(backup_chain)
+
+                    # If the added block was an former orphan,
+                    # delete the block from the orphan pool:
+                    if new_block.id in self.orphan_block_pool.keys():
+                        del self.orphan_block_pool[new_block.id]
+                        print('Deleted block from orphan pool')
+
+                    # A new chain was created.
+                    # Check if any Orphan block can be added to the chain
+                    # via a recursion.
+                    print('Start orphan processing')
+                    for orphan in self.orphan_block_pool.values():
+                        self.process_incoming_block(orphan, pause_mining_event)
+                    print('End orphan processing')
+
+                    # A block can only be added to one chain in the pool, otherwise redundancy.
+                    # Therefor get out of the for loop if the block was added and
+                    # the post processing is done.
+                    break
+
+            # If the block hasn't been added to any chain, add it to the orphan set.
+            # Else, since at least one new chain has been created check if former orphans
+            # can bee added now.
+            if is_orphan:
+
+                # If it is an orphan delete the backup chain (efficient)
+                backup_chain = None
+
+                # And add block to orphan pool if not already part of it
+                if new_block.id not in self.orphan_block_pool.keys():
+                    self.orphan_block_pool[new_block.id] = new_block
+
+            # Clean the orphan block pool, i.e. throw out very old orphans
+            self.clean_orphan_block_pool()
+
+            # If mining was paused, restart it now
+            if pause_mining_event.is_set():
+                pause_mining_event.clear()
+                print('Mining on the node restarted')
+
+            print('Block procssing finished for Block ' + new_block.id[:7] + '...')
+            print('Primary chain id ' + str(self.primary_chain_id))
+            print('Primary chain legnth ' + str(len(self.chains[str(self.primary_chain_id)].chain)))
+            print('Orphan pool size ' + str(len(self.orphan_block_pool)))
+            print('Number of chains ' + str(len(self.chains)))
+
+            # Return True since block has been successfully processed
+            return True
+        # In case te Block is no Orphan and has been processed in the past:
+        else:
+            print('Block has been processed in the past')
+            return False
+
+    def get_primary_chain(self):
+        # Returns the current primary chain of the pool
+
+        return (self.chains[str(self.primary_chain_id)])
+
+    def set_primary_chain(self):
+        # Selects the primary chain according to the POW rule.
+        # Returns True if new primary chain was set, False otherwise.
+        # If new primary chain was identified, mining has to be restarted.
+
+        # Get pow of current primary chain
+        max_pow_chain_id = self.primary_chain_id
+        max_pow = self.chains[str(self.primary_chain_id)].pow
+
+        # Indicator whether new prim. chain is set
+        new_primary_chain = False
+
+        # Iterate over all chains in the pool
+        for chain_id, chain in self.chains.items():
+            # Check if POW is larger than current max_pow.
+            # If equal, check if last block was mined earlier.
+            if chain.pow == max_pow:
+                if chain.get_last_block().timestamp < \
+                        self.chains[str(max_pow_chain_id)].get_last_block().timestamp:
+                    new_primary_chain = True
+                    max_pow = chain.pow
+                    max_pow_chain_id = chain.id
+            elif chain.pow > max_pow:
+                new_primary_chain = True
+                max_pow = chain.pow
+                max_pow_chain_id = chain_id
+
+        if new_primary_chain:
+            # When done looping all chains, set primary chain id.
+            self.primary_chain_id = max_pow_chain_id
+            return True
+            print('New primary chain selected')
+        else:
+            return False
+
+    def add_backuped_chain(self, backuped_chain):
+        # Assigns an id to  the backuped_chain
+        # and adds it to the pool.
+        self.current_chain_itterator += 1
+        print('New chain with id ' + str(self.current_chain_itterator) + ' created.')
+        self.chains[str(self.current_chain_itterator)] = backuped_chain
+
+    def clean_orphan_block_pool(self):
+        # Deletes orphan blocks that are too old
+
+        for orphan in self.orphan_block_pool.values():
+            # If an orphan block is older than 30 minutes
+            # --> delete it and remove it from the list of seen ids.
+            if orphan.timestamp < time() - 1000 * 60 * 30:
+                del (self.orphan_block_pool[orphan.id])
+                self.seen_block_ids.remove(orphan.id)
+
+    def propagate_block(self, block_id):
+        # Dummy for now
+
+        pass
+
+    def add_transaction_to_mempools(self, transaction):
+        # Tries to add the transaction to all chains of the Node.
+        # Return 'True' if processed 'False' if transaction is not new to the node.
+
+        # Check if transaction is unknown to the node, if so process it.
+        if transaction.id not in self.seen_transaction_ids:
+            self.seen_transaction_ids.append(transaction.id)
+
+            added_for_primary_chain = False
+            for chain_id, chain in self.chains.items():
+                result = False
+                result = chain.process_transaction(transaction)
+                if chain_id == str(self.primary_chain_id):
+                    if result == True:
+                        added_for_primary_chain = True
+            # Only propagate the trancaction if added to the primary chain
+            if added_for_primary_chain:
+                print('Node ' + self.address + ' added transaction ' + \
+                      transaction.id[:3] + '... to its prim. chain mempool.')
+                self.propagate_transaction(transaction)
+            return (True)
+        else:
+            return (False)
+
+    def get_UTXOs_for_public_key(self, public_key):
+        # Returns an OD of unspent UTXOs of the primary chain which are also
+        # not part of mempool transactions (of the primary chain's mempool)
+
+        UTXOs_for_public_key = OrderedDict()
+        # Loop through UTXO ids
+        for UTXO_id in self.chains[str(self.primary_chain_id)].UTXOs.keys():
+            # Get rid of the UTXOs used in another mempool transaction:
+            if UTXO_id not in self.chains[str(self.primary_chain_id)].mempool_UTXOs.keys():
+                # Get the UTXO for the specific id
+                candidate_UTXO = self.chains[str(self.primary_chain_id)]. \
+                    get_UTXO_by_id(UTXO_id)
+
+                # If UTXO belongs to public key, add it to return dict.
+                if candidate_UTXO.recipient == public_key:
+                    UTXOs_for_public_key[candidate_UTXO.id] = \
+                        candidate_UTXO.get_full_odict()
+        return (UTXOs_for_public_key)
+
+    ## New (4_3) 3
+    def register_a_neighbor(self, neighbor_address):
+        # Registers a neighbor and returns list of other neighbors
+        # neglecting the new registered one.
+        # This method handles *incoming* neighboring requests
+
+        # Check if neighbor is registered yet, if not register
+        if neighbor_address not in self.neighbors:
+            self.neighbors.append(neighbor_address)
+            print(str(self.address) + ' added neighbor ' + str(neighbor_address))
+        #
+        return [x for x in self.neighbors if x != neighbor_address]
+
+    ## New (4_3) 4
+    def register_as_neighbor(self, parent_node):
+        # Registers as neighbor at the parent_node and adds the neighbors
+        # of the parent node to the own neighbors list (if not yet part of it).
+        # This method posts *outgoing* neighboring requests.
+        # Note that we use the 'get' request here since as return we want to get
+        # the list of the parent_node's neighbors.
+
+        # Pass the own address
+        request_data = {'address': self.address}
+        parent_neighbors_json = requests.get('http://' + parent_node + '/register_a_neighbor',
+                                             data=request_data).content
+        # Make a list out of it
+        parent_neighbors = json.loads(parent_neighbors_json)
+        if len(parent_neighbors) > 0:
+            # Go through the neighbors and add them if they are not already known.
+            # Also process the new neighbor's neighbors (recursively).
+            for n in parent_neighbors:
+                if n not in self.neighbors:
+                    self.neighbors.append(n)
+                    print(str(self.address) + ' added neighbor ' + str(n))
+                    # Recursion
+                    self.register_as_neighbor(n)
+
+    ## New (4_3) 5
+    def propagate_transaction(self, transaction):
+        # Posts the transaction to randomly selected set
+        # of neighbors.
+
+        transaction_json = json.dumps(transaction.get_full_odict()).encode('utf8')
+        selected_neighbors = self.get_neighbor_selection(2)
+        if selected_neighbors:
+            for n in selected_neighbors:
+                result = requests.post('http://' + n + '/post_transaction', data=transaction_json)
+
+    ## New (4_3) 6
+    def get_neighbor_selection(self, max_number_of_neighbors):
+        # Generates and returns a random set of neighbors.
+        # Returns None if no neighbor is set.
+
+        # Set max number of neighbors to post to here
+        num_to_select = min(len(self.neighbors), max_number_of_neighbors)
+        if num_to_select > 0:
+            selected_neighbors = random.sample(self.neighbors, num_to_select)
+            return selected_neighbors
+        else:
+            return None
