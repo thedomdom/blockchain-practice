@@ -6,6 +6,7 @@ from Crypto.Signature import DSS
 from Crypto.Hash import SHA256
 import binascii
 from time import time
+from time import sleep
 import random
 
 from collections import OrderedDict
@@ -72,7 +73,6 @@ class Wallet:
 
             self.balance = balance
 
-    ## New (4_3) 1
     def create_signed_transaction(self, recipient_pub_key, value):
         # Creates a signed Transaction with UTXOs from the own UTXO Pool
         # The Wallet has to be connected to a parent FullNode to
@@ -112,7 +112,6 @@ class Wallet:
             print('No parent not connected, please connect parent node first.')
             return (None)
 
-    ## New (4_3) 2
     def post_signed_transaction(self, signed_transaction):
         # Posts the signed_transaction to the parent full node.
 
@@ -207,10 +206,10 @@ class Transaction:
         h = SHA256.new(str(self.odict_transaction()).encode('utf8'))
         try:
             verifier.verify(h, binascii.unhexlify(self.signature))
-            return (True)
+            return True
         # In case the signature is no authentic, the verifier throws a ValueError
         except ValueError:
-            return (False)
+            return False
 
     def verify_transaction_id(self):
         # Check if the id matched the Transaction content
@@ -522,7 +521,7 @@ class Block:
 
 
 class Blockchain:
-    initial_difficulty = 4
+    initial_difficulty = 5
     initial_block_reward = 50
     half_time_in_blocks = 10
     max_block_size_in_transactions = 5
@@ -652,7 +651,8 @@ class Blockchain:
                                            OrderedDict({coinbase_output.id: coinbase_output}), 0)
         return (coinbase_transaction)
 
-    def mine_block(self, public_key_receiver_coinbase_transaction):
+    ## New(4_5) 1
+    def mine_block(self, public_key_receiver_coinbase_transaction, pause_mining_event):
         # Creates a valid block from the transactions in the mempool.
         # public_key_receiver_coinbase_transaction should be a public key belonging
         # to the miner of the block.
@@ -688,10 +688,18 @@ class Blockchain:
             # Check if the first #initial_difficulty figures of the hash are equal to 0
             # if not  continue mining
             # Note: Mining is done on the OrderedDict version
+            ## New(4_5) 2
+
             while not candidate_block_id[:self.initial_difficulty] == \
-                      '0' * self.initial_difficulty:
+                      '0' * self.initial_difficulty and not pause_mining_event.is_set():
                 candidate_block_odict['nonce'] = candidate_block_odict['nonce'] + 1
                 candidate_block_id = hash_stuff(candidate_block_odict)
+
+            ## New(4_5) 3
+            if pause_mining_event.is_set():
+                # Sleep not necessary/efficient but easier that way to test
+                sleep(1)
+                return (None)
 
             # If mining was successful, put the solution into the Block() object
             candidate_block.nonce = candidate_block_odict['nonce']
@@ -854,7 +862,7 @@ class FullNode:
                         self.chains[str(max_pow_chain_id)].get_last_block().timestamp:
                     new_primary_chain = True
                     max_pow = chain.pow
-                    max_pow_chain_id = chain.id
+                    max_pow_chain_id = chain_id
             elif chain.pow > max_pow:
                 new_primary_chain = True
                 max_pow = chain.pow
@@ -885,10 +893,16 @@ class FullNode:
                 del (self.orphan_block_pool[orphan.id])
                 self.seen_block_ids.remove(orphan.id)
 
+    ## New(4_4) 1
     def propagate_block(self, block_id):
-        # Dummy for now
+        # Posts the transaction to randomly selected set
+        # of neighbors.
 
-        pass
+        block_json = json.dumps(self.get_primary_chain().chain[block_id].get_full_odict()).encode('utf8')
+        selected_neighbors = self.get_neighbor_selection(2)
+        if selected_neighbors:
+            for n in selected_neighbors:
+                result = requests.post('http://' + n + '/post_block', data=block_json)
 
     def add_transaction_to_mempools(self, transaction):
         # Tries to add the transaction to all chains of the Node.
@@ -899,9 +913,10 @@ class FullNode:
             self.seen_transaction_ids.append(transaction.id)
 
             added_for_primary_chain = False
-            for chain_id, chain in self.chains.items():
+            chains_copy = copy.deepcopy(self.chains)
+            for chain_id in chains_copy.keys():
                 result = False
-                result = chain.process_transaction(transaction)
+                result = self.chains[chain_id].process_transaction(transaction)
                 if chain_id == str(self.primary_chain_id):
                     if result == True:
                         added_for_primary_chain = True
@@ -933,7 +948,6 @@ class FullNode:
                         candidate_UTXO.get_full_odict()
         return (UTXOs_for_public_key)
 
-    ## New (4_3) 3
     def register_a_neighbor(self, neighbor_address):
         # Registers a neighbor and returns list of other neighbors
         # neglecting the new registered one.
@@ -946,7 +960,6 @@ class FullNode:
         #
         return [x for x in self.neighbors if x != neighbor_address]
 
-    ## New (4_3) 4
     def register_as_neighbor(self, parent_node):
         # Registers as neighbor at the parent_node and adds the neighbors
         # of the parent node to the own neighbors list (if not yet part of it).
@@ -970,7 +983,6 @@ class FullNode:
                     # Recursion
                     self.register_as_neighbor(n)
 
-    ## New (4_3) 5
     def propagate_transaction(self, transaction):
         # Posts the transaction to randomly selected set
         # of neighbors.
@@ -981,7 +993,6 @@ class FullNode:
             for n in selected_neighbors:
                 result = requests.post('http://' + n + '/post_transaction', data=transaction_json)
 
-    ## New (4_3) 6
     def get_neighbor_selection(self, max_number_of_neighbors):
         # Generates and returns a random set of neighbors.
         # Returns None if no neighbor is set.
@@ -993,3 +1004,53 @@ class FullNode:
             return selected_neighbors
         else:
             return None
+
+    ## New(4_4) 2
+    def get_list_of_seen_blocks(self):
+        # Returns the list of the seen block ids
+        # of the FullNode.
+
+        return (self.seen_block_ids)
+
+    ## New(4_4) 3
+    def get_block_by_id(self, block_id):
+        # Returns the block  which corresponds
+        # to the block_id
+
+        for blockchain in self.chains.values():
+            if block_id in blockchain.chain.keys():
+                return (blockchain.chain[block_id])
+
+    ## New(4_4) 4
+    def initialize_node(self, pause_mining_event):
+        # Initializes the FullNode by requesting all unknown
+        # blocks from its neighbors.
+
+        # Pause mining while initialization
+        pause_mining_event.set()
+
+        print('Mining interrupted for initialization.')
+
+        # Iterate through the neighbors and get their
+        # blocks to build up an own set of chains.
+        for n in self.neighbors:
+            # Request the seen blocks by the neighbor
+            n_seen_blocks_json = requests.get('http://' + n + '/get_list_of_seen_blocks').content
+            # Make a list out of it
+            n_seen_blocks = json.loads(n_seen_blocks_json)
+            if len(n_seen_blocks) > 0:
+                # Loop through the block ids and process the unknown ones
+                for block_id in n_seen_blocks:
+                    if block_id not in self.seen_block_ids:
+                        # Request the content of the unknown block
+                        # and process the result.
+                        request_data = {'block_id': block_id}
+                        block_json = requests.get('http://' + n + '/get_block_by_id', data=request_data).content
+                        block_odict = create_odict_from_json(block_json)
+                        block = Block.from_odict(block_odict)
+                        self.process_incoming_block(block, pause_mining_event)
+
+        # Restart mining
+        if pause_mining_event.is_set():
+            pause_mining_event.clear()
+            print('Mining on the node restarted.')
